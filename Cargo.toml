@@ -1,0 +1,27 @@
+[package]
+name = "sorby"
+version = "0.1.0"
+edition = "2021"
+description = "SORBY Operates Rust Binary Yards — a from-scratch container runtime exploring Linux namespaces and cgroups v2."
+license = "MIT"
+
+[[bin]]
+name = "sorby"
+path = "src/main.rs"
+
+[dependencies]
+# Direct POSIX & Linux system call bindings (mount, unshare, pivot_root, etc.)
+nix = { version = "0.29", features = ["sched", "mount", "fs", "process", "signal", "hostname", "user"] }
+
+# Modern, declarative CLI parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# Robust error handling
+anyhow = "1.0"
+
+# Terminal logging for debugging lifecycle transitions
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 2

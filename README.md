@@ -1,0 +1,179 @@
+# contain-rs
+
+`contain-rs` is an educational, dependency-minimal container runtime written
+from scratch in Rust. It explores the low-level Linux kernel features that
+power modern containerization platforms like Docker, containerd, and runc —
+by talking to the kernel directly instead of wrapping an existing daemon.
+
+```
+sudo contain-rs run \
+  --rootfs ./alpine-rootfs \
+  --memory 50M \
+  --cpu 0.2 \
+  -- /bin/sh
+```
+
+## Key capabilities
+
+- **Namespace isolation** — partitions PID, mount, UTS (hostname), and IPC
+  namespaces via `unshare`/`clone`.
+- **Hard resource ceilings** — Linux Cgroups v2 enforce memory quotas (kernel
+  OOM-kills on violation) and CPU bandwidth throttling.
+- **Filesystem sandboxing** — `pivot_root` traps the process inside an
+  isolated rootfs (e.g. Alpine Linux) with a fresh, private `/proc` and `/sys`.
+- **Zero-daemon architecture** — a single static-ish CLI binary using the
+  self-exec fork pattern to manage the process lifecycle safely in Rust.
+
+## Requirements
+
+- Linux kernel ≥ 5.8 (Cgroups v2 support), any modern distro.
+- Root / sudo.
+- Rust (`rustup` — stable toolchain is fine).
+
+## Setup
+
+```bash
+# 1. Get a minimal rootfs to run inside
+mkdir -p ./alpine-rootfs
+curl -o alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.1-x86_64.tar.gz
+tar -xzf alpine.tar.gz -C ./alpine-rootfs
+
+# 2. Build
+cargo build --release
+```
+
+## Run
+
+```bash
+sudo ./target/release/contain-rs run \
+  --rootfs ./alpine-rootfs \
+  --memory 50M \
+  --cpu 0.2 \
+  -- /bin/sh
+```
+
+## Validate isolation
+
+**PID namespace** — inside the shell, `ps aux` should show only your shell
+(as PID 1) and nothing from the host:
+
+```
+/ # ps aux
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    2 root      0:00 ps aux
+```
+
+**Hostname namespace**:
+
+```
+/ # hostname
+isolated-box
+```
+
+**Cgroups memory enforcement** — start with `--memory 20M`, then inside the
+container try to allocate more than that:
+
+```
+/ # echo "nameserver 8.8.8.8" > /etc/resolv.conf   # see "DNS resolution" note below
+/ # apk add python3
+/ # python3 -c 'x = "a" * (50 * 1024 * 1024)'
+Killed
+```
+
+The (ignored-by-default) tests in `tests/integration.rs` automate all three
+checks — run them explicitly with:
+
+```bash
+sudo -E cargo test -- --ignored --nocapture
+```
+
+They're `#[ignore]`d because creating new namespaces needs `CAP_SYS_ADMIN`,
+which most CI runners and sandboxed containers don't grant.
+
+## Design notes / corrections vs. the original blueprint
+
+Two details in early sketches of this design don't quite hold up against how
+Linux namespaces and cgroups v2 actually behave, and are worth calling out
+explicitly since they're easy to get wrong:
+
+1. **`unshare(CLONE_NEWPID)` doesn't move the calling process.** Per
+   `unshare(2)`, only *future children* of the process that calls `unshare`
+   land in the new PID namespace — the caller itself does not, even across a
+   subsequent `execve`. A naive self-exec (`unshare` in `pre_exec`, then exec
+   straight into the user's command) would silently fail Test 1: the shell
+   would still see the host's process tree. `child_init` fixes this with one
+   extra internal `fork()` — the grandchild becomes PID 1 in the new
+   namespace and execs the user's command, while the original process just
+   waits and relays the exit status (this mirrors how real container shims
+   work).
+2. **Cgroups v2 controllers must be enabled top-down.** Writing to a child
+   cgroup's `memory.max`/`cpu.max` only takes effect if `memory`/`cpu` are
+   listed in the parent's `cgroup.subtree_control`. `cgroups::enable_controllers`
+   does this best-effort at startup (many systemd-managed hosts already have
+   it enabled, so failures here are logged, not fatal).
+3. `/sys` is mounted alongside `/proc` inside the new mount namespace, matching
+   the architecture diagram (the original code sketch only mounted `/proc`).
+4. **Memory limits are silently defeated by swap unless you cap it too.**
+   Cgroups v2 tracks RAM (`memory.max`) and swap (`memory.swap.max`)
+   separately, and `memory.swap.max` defaults to `max` (unlimited) on a fresh
+   cgroup. On a host with swap enabled — e.g. Fedora Workstation's default
+   zram swap — a process that exceeds `memory.max` just gets its excess
+   anonymous pages pushed to swap instead of being OOM-killed, so the limit
+   *looks* like it's doing nothing even though it's set correctly. This was
+   caught empirically: a `--memory 20M` container ran a 50MB Python
+   allocation to completion without incident on a zram-swap host. The fix is
+   the same one Docker applies by default (`--memory-swap` tracks `--memory`
+   unless overridden) — `cgroups::set_memory_limit` now also writes `0` to
+   `memory.swap.max`, so hitting the RAM ceiling has nowhere to go but the
+   OOM killer.
+5. **DNS resolution doesn't work out of the box, and this is a known,
+   unfixed gap.** The container shares the host's network namespace (we
+   don't `unshare(CLONE_NEWNET)`), but Alpine's minimal rootfs ships without
+   a usable `/etc/resolv.conf`, so `apk add` and any other DNS lookup inside
+   the container fails with `temporary error (try again later)` until one is
+   provided. Real container runtimes (e.g. Docker, when a container shares
+   the host network stack) bind-mount the host's `/etc/resolv.conf` into the
+   container automatically. `contain-rs` doesn't do this yet — for now, the
+   workaround is manual, from inside the container shell:
+
+   ```
+   echo "nameserver 8.8.8.8" > /etc/resolv.conf
+   ```
+
+   A proper fix (bind-mounting the host's `/etc/resolv.conf` during
+   `filesystem::pivot_root_into`, similar to how `/proc` and `/sys` are
+   mounted) is a reasonable next step if this project continues.
+
+## Repository layout
+
+```
+contain-rs/
+├── Cargo.toml
+├── src/
+│   ├── main.rs         # CLI entry point (Run vs ChildInit)
+│   ├── container.rs    # Core process orchestration (run + child_init)
+│   ├── namespaces.rs   # unshare/self-exec abstraction
+│   ├── filesystem.rs   # mounts, pivot_root, /proc + /sys setup
+│   └── cgroups.rs      # Cgroups v2 file reader/writer
+├── tests/
+│   └── integration.rs  # Isolation + limit-enforcement tests (--ignored)
+└── README.md
+```
+
+## Extending it further
+
+- **OverlayFS (copy-on-write)** — mount an overlay with the extracted rootfs
+  as a read-only lower layer and a scratch upper layer, discarded on exit, so
+  the container is ephemeral and the base rootfs is never mutated.
+- **Seccomp filters** — via the `seccomp` / `libseccomp` crate, block
+  dangerous syscalls (`reboot`, `swapon`, etc.) inside the container.
+- **Image puller** — fetch and unpack images from a Docker-compatible
+  registry API without needing Docker installed.
+
+## Resume bullet
+
+> Architected a container runtime in Rust leveraging Linux namespaces,
+> Cgroups v2, and `pivot_root`, enforcing process isolation, memory
+> ceilings, and isolated mount spaces with zero reliance on external
+> daemons.
