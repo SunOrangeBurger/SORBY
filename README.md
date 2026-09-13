@@ -1,10 +1,9 @@
 # SORBY
 
-**S**ORBY **O**perates **R**ust **B**inary **Y**ards — a recursive acronym in
-the GNU/PHP tradition.
+**S**ORBY **O**perates **R**ust **B**inary **Y**ards — named in proper linux tradition.
 
-SORBY is an educational, dependency-minimal container runtime written from
-scratch in Rust. It explores the low-level Linux kernel features that power
+SORBY is an educational(maybe), dependency-minimal container runtime written from
+scratch in Rust(that's the selling point). It explores the low-level Linux kernel features that power
 modern containerization platforms like Docker, containerd, and runc — by
 talking to the kernel directly instead of wrapping an existing daemon.
 
@@ -32,7 +31,7 @@ sudo sorby run \
 
 ## Requirements
 
-- Linux kernel ≥ 5.8 (Cgroups v2 support), any modern distro.
+- Linux kernel ≥ 5.8 (Cgroups v2 support), most modern distro.
 - Root / sudo.
 - Rust (`rustup` — stable toolchain is fine).
 
@@ -60,9 +59,8 @@ sudo ./target/release/sorby run \
 
 ## Validate isolation
 
-All of the following have been run and confirmed on real hardware (Fedora
-Workstation), not just reasoned about — see the design notes below for the
-bugs this process actually caught.
+All of the following have been run and confirmed on my lovely linux machine(Fedora
+Workstation). We caught a few bugs along the way and sorted them out.
 
 **PID namespace** — inside the shell, `ps aux` should show only your shell
 (as PID 1) and nothing from the host:
@@ -143,75 +141,12 @@ sudo -E cargo test -- --ignored --nocapture
 They're `#[ignore]`d because creating new namespaces needs `CAP_SYS_ADMIN`,
 which most CI runners and sandboxed containers don't grant.
 
-## Design notes / corrections vs. the original blueprint
-
-Several details in early sketches of this design didn't hold up against how
-Linux namespaces and cgroups v2 actually behave — each of these was caught by
-actually running the thing, not by inspection:
-
-1. **`unshare(CLONE_NEWPID)` doesn't move the calling process.** Per
-   `unshare(2)`, only *future children* of the process that calls `unshare`
-   land in the new PID namespace — the caller itself does not, even across a
-   subsequent `execve`. A naive self-exec (`unshare` in `pre_exec`, then exec
-   straight into the user's command) would silently fail the PID isolation
-   test: the shell would still see the host's process tree. `child_init`
-   fixes this with one extra internal `fork()` — the grandchild becomes PID 1
-   in the new namespace and execs the user's command, while the original
-   process just waits and relays the exit status (this mirrors how real
-   container shims work).
-2. **Cgroups v2 controllers must be enabled top-down.** Writing to a child
-   cgroup's `memory.max`/`cpu.max`/`pids.max` only takes effect if
-   `memory`/`cpu`/`pids` are listed in the parent's `cgroup.subtree_control`.
-   `cgroups::enable_controllers` does this best-effort at startup (many
-   systemd-managed hosts already have it enabled, so failures here are
-   logged, not fatal).
-3. `/sys` is mounted alongside `/proc` inside the new mount namespace, matching
-   the architecture diagram (the original code sketch only mounted `/proc`).
-4. **Memory limits are silently defeated by swap unless you cap it too.**
-   Cgroups v2 tracks RAM (`memory.max`) and swap (`memory.swap.max`)
-   separately, and `memory.swap.max` defaults to `max` (unlimited) on a fresh
-   cgroup. On a host with swap enabled — e.g. Fedora Workstation's default
-   zram swap — a process that exceeds `memory.max` just gets its excess
-   anonymous pages pushed to swap instead of being OOM-killed, so the limit
-   *looks* like it's doing nothing even though it's set correctly. This was
-   caught empirically: a `--memory 20M` container ran a 50MB Python
-   allocation to completion without incident on a zram-swap host. The fix is
-   the same one Docker applies by default (`--memory-swap` tracks `--memory`
-   unless overridden) — `cgroups::set_memory_limit` now also writes `0` to
-   `memory.swap.max`, so hitting the RAM ceiling has nowhere to go but the
-   OOM killer.
-5. **DNS resolution doesn't work out of the box, and this is a known,
-   unfixed gap.** The container shares the host's network namespace (we
-   don't `unshare(CLONE_NEWNET)`), but Alpine's minimal rootfs ships without
-   a usable `/etc/resolv.conf`, so `apk add` and any other DNS lookup inside
-   the container fails with `temporary error (try again later)` until one is
-   provided. Real container runtimes (e.g. Docker, when a container shares
-   the host network stack) bind-mount the host's `/etc/resolv.conf` into the
-   container automatically. SORBY doesn't do this yet — for now, the
-   workaround is manual, from inside the container shell:
-
-   ```
-   echo "nameserver 8.8.8.8" > /etc/resolv.conf
-   ```
-
-   A proper fix (bind-mounting the host's `/etc/resolv.conf` during
-   `filesystem::pivot_root_into`, similar to how `/proc` and `/sys` are
-   mounted) is a reasonable next step if this project continues.
-6. **Cgroup cleanup can lag by a beat after `Ctrl+C`, but it isn't a leak.**
-   Interrupting a running container with `SIGINT` instead of exiting cleanly
-   can leave `/sys/fs/cgroup/sorby_<pid>` briefly visible after the process
-   is gone. On inspection this wasn't an orphaned process (`cgroup.procs`
-   inside it was already gone by the time the directory itself vanished) —
-   it's ordinary cgroups v2 teardown latency after the last process exits,
-   not a persistent resource leak. Not a bug, but worth knowing so a
-   lingering directory during quick manual testing doesn't get mistaken for
-   one.
 
 ## Security posture / threat model — read this before trusting it with anything untrusted
 
 SORBY isolates *well-behaved-but-resource-hungry* code well. It is **not** a
 sandbox suitable for deliberately malicious binaries, and shouldn't be
-treated as one. Specifically, as of this version:
+treated as one. Specifically, as of this version(this where we open up future scope):
 
 - The container process runs as **real root on the host** — there's no
   `CLONE_NEWUSER`/UID remapping, so "root inside the container" is
@@ -238,7 +173,7 @@ resource limits alone don't get you there — the missing pieces above
 quotas) are what separate this from something like gVisor, Firecracker
 microVMs, or Docker run with `--security-opt`, `--cap-drop`, and rootless
 mode. Treat SORBY as a teaching tool and a resource-governor for code you
-already trust not to be adversarial, not as a malware sandbox.
+already trust not to be adversarial, not as a malware sandbox(yet).
 
 ## Repository layout
 
@@ -285,9 +220,6 @@ launcher" for untrusted code, and how much work each is:
 7. **Image puller** — fetch and unpack images from a Docker-compatible
    registry API without needing Docker installed. (Convenience, not security.)
 
-## Resume bullet
+## Where on earth are we know?
 
-> Architected a container runtime in Rust leveraging Linux namespaces,
-> Cgroups v2, and `pivot_root`, enforcing process isolation, memory
-> ceilings, and isolated mount spaces with zero reliance on external
-> daemons.
+Currently we are waiting for some inspiration and need to strike us, and we will continue on our journey towards perfect containerization against malicious code, binaries, and basically creating a safe mode for any and all applications on linux, with the ability to control CPU, disk and network access, and so much more.
